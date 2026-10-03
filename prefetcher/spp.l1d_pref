@@ -1,16 +1,286 @@
 #include "cache.h"
 
+#define STRIDE_HISTORY_SIZE 5
+#define SIGNATURE_TABLE_SIZE 64
+
+#define PREFETCH_DEGREE 3
+#define MASK_IP 0xFF
+
+#define PATTERN_UNIFROM 0
+#define PATTERN_NON_UNIFORM 1
+
+#define STATE_THRESHOLD 3
+
+#define PREFETCH_TRACKER_SIZE 64
+
+class IP_TRACKER{
+
+    public:
+        // the ip we are tracking
+        uint64_t ip;
+
+        // Keep track of all seen strides
+        int32_t stride_history[STRIDE_HISTORY_SIZE];
+
+        // Number of valid strides currently stored  
+        int32_t history_count;
+
+        //the last observed stride
+        int32_t last_stride;
+
+        // used to classify the type of pattern we are observing
+        uint8_t pattern_type;
+
+        // last address for accessed by this IP
+        uint64_t last_cl_addr;
+
+        // lru used for replacement
+        uint32_t lru;
+
+        // Indicates how confident the stride is
+        int32_t state;
+
+
+        IP_TRACKER(){
+            ip =0;
+            pattern_type = PATTERN_UNIFROM;
+            history_count = 0;
+            last_stride = 0;
+            last_cl_addr = 0;
+            lru = 0;
+            state = 0;
+
+            for(int i=0 ; i<STRIDE_HISTORY_SIZE ; i++){
+                stride_history[i] = 0;
+            }
+        }
+};
+
+class SIGNATURE_ENTRY{
+    public:
+        // Signature repr. a recent stride sequence
+        uint64_t signature;
+
+        // stride observed for this signature
+        uint32_t next_stride;
+
+        // repr. how confident this signature is
+        int32_t confidence;
+
+        // whether this entry currently contains a valid info
+        bool valid;
+
+        // used for replacement
+        uint32_t lru;
+
+        SIGNATURE_ENTRY(){
+            signature = 0;
+            next_stride = 0;
+            confidence = 0;
+            valid = 0;
+        }
+};
+
+class PREFETCH_ENTRY{
+    public:
+        // Cache-line address that was prefetched
+        uint64_t cl_addr;
+
+        // Whether this entry is valid
+        bool valid;
+
+        // Whether this prefetch was later used by a demand access
+        bool used;
+
+
+        PREFETCH_ENTRY(){
+            cl_addr = 0;
+            valid = false;
+            used = false;
+        }
+};
+
+// track ips
+IP_TRACKER trackers[IP_TRACKER_COUNT];
+
+// track all observed non-unifrom patterns for signature -> next stride mapping
+SIGNATURE_ENTRY signatures[SIGNATURE_TABLE_SIZE];
+
+// Track recently issued prefetches for accuracy calculation
+PREFETCH_ENTRY prefetch_tracker[PREFETCH_TRACKER_SIZE];
+
+
+// Circular position for inserting new prefetch records
+uint32_t prefetch_tracker_index;
+
+
+// Current dynamic prefetch degree
+int32_t current_degree;
+
+
+// Overall statistics
+uint64_t total_prefetches;
+uint64_t useful_prefetches;
+
+// Statistics for the current accuracy epoch
+uint64_t epoch_prefetches;
+uint64_t epoch_useful_prefetches;
+
+
 
 void CACHE::l1d_prefetcher_initialize() 
 {
     std::cout << "------------------------------------------------" << std::endl;
     std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
+
+    // Initialize IP tracker LRU
+    for(int i = 0; i < IP_TRACKER_COUNT; i++){
+        trackers[i].lru = i;
+    }
+
+    // Initialize signature table
+    for(int i = 0; i < SIGNATURE_TABLE_SIZE; i++){
+        signatures[i].valid = false;
+        signatures[i].lru = i;
+    }
+
+    // Initialize prefetch tracking table
+    for(int i = 0; i < PREFETCH_TRACKER_SIZE; i++){
+        prefetch_tracker[i].valid = false;
+        prefetch_tracker[i].used = false;
+    }
+
+    // Initialize throttling state
+    prefetch_tracker_index = 0;
+
+    current_degree = PREFETCH_DEGREE;
+
+    total_prefetches = 0;
+    useful_prefetches = 0;
+
+    epoch_prefetches = 0;
+    epoch_useful_prefetches = 0;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-   
+    // Get the block address 
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+
+    // Get masked IP
+    ip = ip & MASK_IP;
+
+    int index = -1;
+    for (index=0; index<IP_TRACKER_COUNT; index++) {
+        if (trackers[index].ip == ip)
+            break;
+    }
+
+    // This is a new IP
+    if(index == IP_TRACKER_COUNT){
+        for (index=0; index<IP_TRACKER_COUNT; index++) {
+            if (trackers[index].lru == (IP_TRACKER_COUNT-1))
+                break;
+        }
+
+        trackers[index].ip = ip;
+        trackers[index].last_cl_addr = cl_addr;
+        trackers[index].last_stride = 0;
+        trackers[index].history_count = 0;
+        trackers[index].state = 0;
+        trackers[index].pattern_type = PATTERN_UNIFROM;
+
+        // increment lru of other index makes sure we always have a evict ip ready
+	    for (int i=0; i<IP_TRACKER_COUNT; i++) {
+            if (trackers[i].lru < trackers[index].lru)
+                trackers[i].lru++;
+        }
+        trackers[index].lru = 0;
+        return;     
+    }
+
+    // performing sanity check
+    if(index == -1){
+        assert(0);
+    }
+
+    int32_t stride = 0;
+    if (cl_addr > trackers[index].last_cl_addr)
+        stride = cl_addr - trackers[index].last_cl_addr;
+    else {
+        stride = trackers[index].last_cl_addr - cl_addr;
+        stride *= -1;
+    }
+
+    // if same address seen in a row, ignore
+    if(stride == 0){
+        return;
+    }
+
+    // Update the stride history list for this ip, if list is full left shift all
+    if(trackers[index].history_count == STRIDE_HISTORY_SIZE){
+        for(int i=0 ; i<STRIDE_HISTORY_SIZE-1 ; i++){
+            trackers[index].stride_history[i] = trackers[index].stride_history[i+1];
+        }
+        trackers[index].stride_history[STRIDE_HISTORY_SIZE-1] = stride;
+    }else{
+        trackers[index].stride_history[trackers[index].history_count++] = stride;
+    }
+
+    // if ip called only for 2nd time, no way to compare stride or know uniform or not, just update and return
+    if(trackers[index].history_count == 2){
+        trackers[index].last_cl_addr = cl_addr;
+        trackers[index].last_stride = stride;
+
+        return;
+    }
+
+    // Check if ip is following uniform or non-uniform pattern
+    if(trackers[index].pattern_type == PATTERN_UNIFROM){
+        if(trackers[index].stride_history[trackers[index].history_count-2] != stride){
+            trackers[index].pattern_type = PATTERN_NON_UNIFORM;
+            tracker[index].state = 0;
+        }else{
+            trackers[index].state++;
+
+            if(trackers[index].state >= STATE_THRESHOLD){
+                // do some prefetching
+                for (int i=0; i<current_degree; i++) {
+                    uint64_t pf_address = (cl_addr + (stride*(i+1))) << LOG2_BLOCK_SIZE;
+
+                    // only issue a prefetch if the prefetch address is in the same 4 KB page
+                    // as the current demand access address
+                    if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                        break;
+
+                    // check the MSHR occupancy to decide if we're going to prefetch to the L1 or L2
+                    if (MSHR.occupancy < (MSHR.SIZE>>1))
+                        prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+                    else
+                        prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+                }
+            }
+
+        }
+    }
+
+
+    if(trackers[index].pattern_type == PATTERN_NON_UNIFORM){
+        
+    }
+
+
+    trackers[index].last_cl_addr = cl_addr;
+    trackers[index].last_stride = stride;
+
+    for(int i = 0; i < IP_TRACKER_COUNT; i++){
+        if(trackers[i].lru < trackers[index].lru)
+            trackers[i].lru++;
+    }
+
+    trackers[index].lru = 0;
+
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
