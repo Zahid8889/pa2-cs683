@@ -7,7 +7,7 @@
 uint32_t l2_rrpv[L2C_SET][L2C_WAY];
 uint64_t instr_acc = 0, instr_miss = 0, total_acc = 0, total_miss = 0;
 bool use_irrip = true;
-double THRESH = 0.40;
+double THRESH = 0.25;
 uint64_t epochs_irrip = 0, epochs_rrip = 0;
 
 bool is_leader(uint32_t set){
@@ -89,7 +89,7 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     // cout << "CPU: " << cpu << "  L2C " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
     // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
     
-    if(is_leader(set) && type != WRITEBACK){
+    if(is_leader(set) && type != WRITEBACK && type != PREFETCH){
         total_acc++;
         if(!hit)
             total_miss++;
@@ -108,10 +108,14 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
     }
 
     bool irrip_mode = !is_leader(set) && use_irrip;
-    if (hit)
-        l2_rrpv[set][way] = 0;
+    if (hit){
+        if(type != PREFETCH)
+            l2_rrpv[set][way] = 0;
+    }
     else{
-        if(isInstruction && irrip_mode)
+        if(type == PREFETCH)
+           l2_rrpv[set][way] = maxRRPV;  //insert with RRPV3 
+        else if(isInstruction && irrip_mode)
             l2_rrpv[set][way] = maxRRPV-2;  //insert with RRPV1
         else
             l2_rrpv[set][way] = maxRRPV-1;  //insert with RRPV2
