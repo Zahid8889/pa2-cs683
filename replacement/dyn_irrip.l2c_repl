@@ -131,16 +131,18 @@ void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
 
             double score = (double)(instr_accesses + instr_misses) / (double)(total_accesses + total_misses);
 
-            if(score > 0.25)
+            if(score > 0.25){
                 if(!use_irrip){
                     switches++;
                 }
                 use_irrip = true;
-            else
+            }
+            else{
                 if(use_irrip){
                     switches++;
                 }
                 use_irrip = false;
+            }
         }
     }
 
