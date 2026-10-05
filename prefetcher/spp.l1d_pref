@@ -147,7 +147,8 @@ uint64_t update_signature(uint64_t signature, int64_t stride){
 // Find the table slot for (ip, signature), the key is returned for checking 
 SIGNATURE_ENTRY& get_signature_entry(uint64_t ip, uint64_t signature, uint64_t &key){
     key = (ip << (SIGNATURE_LENGTH * SIGNATURE_BITS)) | signature;
-    return signatures[(signature ^ ip) % SIGNATURE_TABLE_SIZE]; // Xored with ip for uniformity
+    uint64_t folded = key ^ (key >> 8) ^ (key >> 16) ^ (key >> 24);   // every part of key (ip + all strides) affects the slot, basically used for more uniformity and less hash collision
+    return signatures[folded % SIGNATURE_TABLE_SIZE];
 }
 
 // Learn that signature was followed by which stride
@@ -198,6 +199,10 @@ SIGNATURE_ENTRY* lookup_signature(uint64_t ip, uint64_t signature){
 // Remember a prefetch that was issued
 void record_prefetch(uint64_t cl_addr){
     PREFETCH_ENTRY &entry = prefetch_tracker[cl_addr % PREFETCH_TRACKER_SIZE];
+
+    // same line already requested and not used yet
+    if(entry.valid && !entry.used && entry.cl_addr == cl_addr)
+        return;
 
     entry.cl_addr = cl_addr;
     entry.valid = true;
@@ -440,11 +445,11 @@ void CACHE::l1d_prefetcher_final_stats()
     }
 
 
-    // last entry shown to check if table is functional
-    cout<<"---------- Last Signature table entries --------"<<endl;
-    cout<<endl;
-    cout<< "key \t\t next_stride \t\t confidence \t\t valid" << endl;
-    for(int i=0 ; i<SIGNATURE_TABLE_SIZE ; i++){
-        cout<< signatures[i].key <<" \t\t " << signatures[i].next_stride<<" \t\t "<< signatures[i].confidence << " \t\t "<<signatures[i].valid<<endl;
-    }
+    // last set of entries shown to check if table is functional
+    //cout<<"---------- Last Signature table entries --------"<<endl;
+    //cout<<endl;
+    //cout<< "key \t\t next_stride \t\t confidence \t\t valid" << endl;
+    //for(int i=0 ; i<SIGNATURE_TABLE_SIZE ; i++){
+    //    cout<< signatures[i].key <<" \t\t " << signatures[i].next_stride<<" \t\t "<< signatures[i].confidence << " \t\t "<<signatures[i].valid<<endl;
+    //}
 }
