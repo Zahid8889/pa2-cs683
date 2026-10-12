@@ -1,16 +1,155 @@
 #include "cache.h"
 
+#define IPT_SIZE 64
+#define PT_SIZE 4096
+#define SIG_MASK 0xFFF
+#define SIG_SHIFT 3
+#define MAX_CONF 3
+#define PAGE_LINES 64
+#define PT_THRESH 1
+#define WINDOW 256
+
+struct IPT_Entry{
+    uint16_t valid;
+    uint16_t tag;
+    uint16_t last_page;
+    uint16_t last_offset;
+    int last_stride;
+    uint16_t stride_conf;
+    uint16_t sig;
+};
+
+struct PT_Entry{
+    int next_stride;
+    int conf; 
+};
+
+int spp_degree = 4;
+uint64_t last_useful = 0;
+uint64_t last_issued = 0;
+IPT_Entry ipt[IPT_SIZE];
+PT_Entry pt[PT_SIZE];
+
+uint16_t update_sig(uint16_t sig, int stride){
+    return ((sig<<SIG_SHIFT) ^ (stride & 0x7F)) & SIG_MASK;
+}
 
 void CACHE::l1d_prefetcher_initialize() 
 {
     std::cout << "------------------------------------------------" << std::endl;
     std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
+
+    for(int i=0; i<IPT_SIZE; i++){
+        ipt[i]=IPT_Entry{};
+    }
+    for(int i=0; i<PT_SIZE; i++){
+        pt[i]=PT_Entry{};
+    }
 }
 
-void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
-{
-   
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag){
+    if(type==PREFETCH)
+        return;
+
+    if(pf_lower_level < last_issued){
+        last_useful = pf_useful;
+        last_issued = pf_lower_level;
+    }
+    uint64_t issued_now = pf_lower_level - last_issued;
+    if(issued_now >= WINDOW){
+        double acc = (pf_useful - last_useful)/(double) issued_now;
+
+        if(acc >= 0.75) spp_degree = 6;
+        else if(acc >= 0.5) spp_degree = 4;
+        else if(acc >= 0.25) spp_degree = 2;
+        else spp_degree = 1;
+        
+        last_useful = pf_useful;
+        last_issued = pf_lower_level;
+    }
+    
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    uint64_t page = addr >> LOG2_PAGE_SIZE;
+    int offset = cl_addr & (PAGE_LINES-1);
+
+    int idx = ip % IPT_SIZE;
+    uint16_t tag = (ip >> 6) & 0xFF;
+    IPT_Entry &e = ipt[idx];
+
+    if(!e.valid || e.tag != tag){
+        e.valid = 1;
+        e.tag = tag;
+        e.last_page = page & 0xFF;
+        e.last_offset = offset;
+        e.last_stride = 0;
+        e.stride_conf=0;
+        e.sig = 0;
+        return;
+    }
+
+    if((page & 0xFF) != e.last_page){
+        e.last_page = page & 0xFF;
+        e.last_offset = offset;
+        e.sig = 0;
+        return;
+    }
+
+    int stride = offset - e.last_offset;
+
+    if(stride == 0){
+        return;
+    }
+
+    if(stride == e.last_stride){
+        if(e.stride_conf<MAX_CONF)
+            e.stride_conf++;
+    }else{
+        if(e.stride_conf>0)
+            e.stride_conf--;
+    }
+
+    PT_Entry &p = pt[e.sig];
+    if(p.next_stride == stride){
+        if(p.conf < MAX_CONF)
+            p.conf++;
+    }else if(p.conf > 0){
+        p.conf--;
+    }else{
+        p.next_stride=stride;
+    }
+
+    e.sig = update_sig(e.sig, stride);
+    e.last_stride = stride;
+    e.last_offset = offset;
+    int target;
+    if(e.stride_conf >= 2){
+        target  = offset;
+        for(int i=0; i<spp_degree; i++){
+            target += stride;
+            if(target < 0 || target >= PAGE_LINES){
+                break;
+            }
+            uint64_t pf_addr = (page << LOG2_PAGE_SIZE) + (target << LOG2_BLOCK_SIZE);
+            prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
+        }
+        return;
+    }
+    uint16_t s = e.sig;
+    target = offset;
+    for(int i=0; i<spp_degree; i++){
+        PT_Entry &q = pt[s];
+        if(q.conf < PT_THRESH){
+            break;
+        }
+        target += q.next_stride;
+        if(target < 0 || target >= PAGE_LINES){
+            break;
+        }
+        uint64_t pf_addr = (page << LOG2_PAGE_SIZE) + (target << LOG2_BLOCK_SIZE);
+        prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
+        s = update_sig(s, q.next_stride);
+    }
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
@@ -20,5 +159,5 @@ void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t s
 
 void CACHE::l1d_prefetcher_final_stats()
 {
-
+    cout << "Degree: " << spp_degree << endl;
 }
