@@ -1,0 +1,157 @@
+#include "cache.h"
+
+#include <cmath>
+
+#define DYN_IRRIP_MAX_RRPV 3
+#define DYN_IRRIP_LEADER_STRIDE 64
+#define DYN_IRRIP_LEADER_SETS (L2C_SET / DYN_IRRIP_LEADER_STRIDE)
+#define DYN_IRRIP_DEFAULT_THRESHOLD 0.25
+
+static uint8_t l2_dyn_irrip_rrpv[L2C_SET][L2C_WAY];
+static uint64_t leader_instruction_accesses;
+static uint64_t leader_instruction_misses;
+static uint64_t leader_data_accesses;
+static uint64_t leader_data_misses;
+static double instruction_pressure_threshold = DYN_IRRIP_DEFAULT_THRESHOLD;
+
+static bool is_rrip_leader_set(uint32_t set)
+{
+    return set % DYN_IRRIP_LEADER_STRIDE == 0;
+}
+
+static double sampled_instruction_pressure()
+{
+    const uint64_t total = leader_instruction_accesses + leader_instruction_misses +
+                           leader_data_accesses + leader_data_misses;
+    if (total == 0)
+        return 0.0;
+
+    return static_cast<double>(leader_instruction_accesses + leader_instruction_misses) / total;
+}
+
+static bool use_instruction_policy(uint32_t set)
+{
+    return !is_rrip_leader_set(set) &&
+           sampled_instruction_pressure() > instruction_pressure_threshold;
+}
+
+static void increment_rrpv(uint32_t set)
+{
+    for (uint32_t way = 0; way < L2C_WAY; way++)
+        if (l2_dyn_irrip_rrpv[set][way] < DYN_IRRIP_MAX_RRPV)
+            l2_dyn_irrip_rrpv[set][way]++;
+}
+
+void CACHE::l2c_initialize_replacement()
+{
+    for (uint32_t set = 0; set < L2C_SET; set++)
+        for (uint32_t way = 0; way < L2C_WAY; way++)
+            l2_dyn_irrip_rrpv[set][way] = DYN_IRRIP_MAX_RRPV;
+
+    leader_instruction_accesses = 0;
+    leader_instruction_misses = 0;
+    leader_data_accesses = 0;
+    leader_data_misses = 0;
+
+    const char *threshold_text = getenv("CHAMPSIM_DYN_IRRIP_THRESHOLD");
+    if (threshold_text != NULL) {
+        char *end = NULL;
+        const double requested_threshold = strtod(threshold_text, &end);
+        if (end == threshold_text || *end != '\0' || !std::isfinite(requested_threshold) ||
+            requested_threshold < 0.0 || requested_threshold > 1.0) {
+            cerr << "Invalid CHAMPSIM_DYN_IRRIP_THRESHOLD: " << threshold_text
+                 << " (expected a number between 0 and 1)" << endl;
+            exit(EXIT_FAILURE);
+        }
+        instruction_pressure_threshold = requested_threshold;
+    } else {
+        instruction_pressure_threshold = DYN_IRRIP_DEFAULT_THRESHOLD;
+    }
+
+    cout << "Initialize dynamic I-RRIP for L2C; RRIP leader sets: "
+         << DYN_IRRIP_LEADER_SETS << "; instruction-pressure threshold: "
+         << instruction_pressure_threshold << endl;
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    for (uint32_t way = 0; way < L2C_WAY; way++)
+        if (!current_set[way].valid)
+            return way;
+
+    while (true) {
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            if (l2_dyn_irrip_rrpv[set][way] != DYN_IRRIP_MAX_RRPV)
+                continue;
+            if (!is_rrip_leader_set(set) && current_set[way].prefetch)
+                return way;
+        }
+
+        if (use_instruction_policy(set)) {
+            for (uint32_t way = 0; way < L2C_WAY; way++)
+                if (l2_dyn_irrip_rrpv[set][way] == DYN_IRRIP_MAX_RRPV &&
+                    !current_set[way].instruction)
+                    return way;
+        }
+
+        for (uint32_t way = 0; way < L2C_WAY; way++)
+            if (l2_dyn_irrip_rrpv[set][way] == DYN_IRRIP_MAX_RRPV)
+                return way;
+
+        increment_rrpv(set);
+    }
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+    if (hit && type == WRITEBACK)
+        return;
+
+    const bool demand_access = type == LOAD || type == RFO;
+    if (is_rrip_leader_set(set) && demand_access) {
+        if (isInstruction) {
+            leader_instruction_accesses++;
+            if (!hit)
+                leader_instruction_misses++;
+        } else {
+            leader_data_accesses++;
+            if (!hit)
+                leader_data_misses++;
+        }
+    }
+
+    const bool instruction_policy = use_instruction_policy(set);
+    if (hit) {
+        if (type == PREFETCH && !is_rrip_leader_set(set))
+            return;
+        if (instruction_policy)
+            l2_dyn_irrip_rrpv[set][way] = isInstruction ? 0 : 1;
+        else
+            l2_dyn_irrip_rrpv[set][way] = 0;
+        return;
+    }
+
+    if (type == PREFETCH && !is_rrip_leader_set(set))
+        l2_dyn_irrip_rrpv[set][way] = DYN_IRRIP_MAX_RRPV;
+    else if (instruction_policy)
+        l2_dyn_irrip_rrpv[set][way] = isInstruction ?
+            DYN_IRRIP_MAX_RRPV - 1 : DYN_IRRIP_MAX_RRPV;
+    else
+        l2_dyn_irrip_rrpv[set][way] = DYN_IRRIP_MAX_RRPV - 1;
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    const uint64_t instruction_total = leader_instruction_accesses + leader_instruction_misses;
+    const uint64_t total = instruction_total + leader_data_accesses + leader_data_misses;
+    cout << "DYN_IRRIP threshold: " << instruction_pressure_threshold
+         << " leader_instruction_accesses: " << leader_instruction_accesses
+         << " leader_instruction_misses: " << leader_instruction_misses
+         << " leader_data_accesses: " << leader_data_accesses
+         << " leader_data_misses: " << leader_data_misses
+         << " instruction_pressure: " << (total ? static_cast<double>(instruction_total) / total : 0.0)
+         << " active_mode: " << (sampled_instruction_pressure() > instruction_pressure_threshold ? "I-RRIP" : "RRIP")
+         << endl;
+}
