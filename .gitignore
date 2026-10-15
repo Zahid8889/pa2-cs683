@@ -1,0 +1,6 @@
+*txt
+bin/
+obj/
+*.txt
+.DS_store
+plots/
