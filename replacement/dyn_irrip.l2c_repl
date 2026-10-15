@@ -1,0 +1,169 @@
+#include "cache.h"
+
+#define RRPV_MAX 3
+#define LEADER_COUNT 8
+
+uint32_t age_table[L2C_SET][L2C_WAY];
+
+uint64_t policy_changes = 0;
+
+uint64_t ins_refs = 0;
+uint64_t data_refs = 0;
+uint64_t ins_faults = 0;
+uint64_t data_faults = 0;
+
+bool prefer_ins = false;
+
+bool sampled_set(uint32_t set)
+{
+    return (set % (L2C_SET / LEADER_COUNT)) == 0;
+}
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initializing dynamic L2 replacement" << endl;
+
+    for (uint32_t set = 0; set < L2C_SET; set++) {
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            age_table[set][way] = RRPV_MAX;
+        }
+    }
+
+    policy_changes = 0;
+    ins_refs = 0;
+    data_refs = 0;
+    ins_faults = 0;
+    data_faults = 0;
+    prefer_ins = false;
+}
+
+uint32_t CACHE::l2c_find_victim(
+    uint32_t cpu,
+    uint64_t instr_id,
+    uint32_t set,
+    const BLOCK *current_set,
+    uint64_t ip,
+    uint64_t full_addr,
+    uint32_t type)
+{
+    while (true) {
+        if (!sampled_set(set) && prefer_ins) {
+            for (uint32_t way = 0; way < L2C_WAY; way++) {
+                if (age_table[set][way] == RRPV_MAX &&
+                    !current_set[way].instruction) {
+                    return way;
+                }
+            }
+        }
+
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            if (age_table[set][way] == RRPV_MAX) {
+                return way;
+            }
+        }
+
+        for (uint32_t way = 0; way < L2C_WAY; way++) {
+            if (age_table[set][way] < RRPV_MAX) {
+                age_table[set][way]++;
+            }
+        }
+    }
+
+    assert(0);
+    return 0;
+}
+
+void CACHE::l2c_update_replacement_state(
+    uint32_t cpu,
+    uint32_t set,
+    uint32_t way,
+    uint64_t full_addr,
+    uint64_t ip,
+    uint64_t victim_addr,
+    uint32_t type,
+    uint8_t hit,
+    uint8_t isInstruction)
+{
+    if (type == WRITEBACK && ip)
+        assert(0);
+
+    if (sampled_set(set) && type != WRITEBACK) {
+        if (isInstruction) {
+            ins_refs++;
+
+            if (!hit)
+                ins_faults++;
+        } else {
+            data_refs++;
+
+            if (!hit)
+                data_faults++;
+        }
+
+        uint64_t seen = ins_refs + data_refs;
+
+        if (seen >= 4096) {
+            double ins_rate = ins_refs
+                ? static_cast<double>(ins_faults) / ins_refs
+                : 0.0;
+
+            double data_rate = data_refs
+                ? static_cast<double>(data_faults) / data_refs
+                : 0.0;
+
+
+            bool next_policy =
+                ins_rate > data_rate && ins_rate > 0.40;
+
+            if (next_policy != prefer_ins) {
+                prefer_ins = next_policy;
+                policy_changes++;
+            }
+
+            ins_refs = 0;
+            data_refs = 0;
+            ins_faults = 0;
+            data_faults = 0;
+        }
+    }
+
+    if (sampled_set(set) || !prefer_ins) {
+        age_table[set][way] = hit ? 0 : RRPV_MAX - 1;
+        return;
+    }
+
+    if (hit) {
+        age_table[set][way] = isInstruction ? 0 : 1;
+    } else {
+        age_table[set][way] =
+            isInstruction ? RRPV_MAX - 2 : RRPV_MAX - 1;
+    }
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    uint64_t seen = ins_refs + data_refs;
+    uint64_t misses = ins_faults + data_faults;
+
+    double ins_rate = ins_refs
+        ? static_cast<double>(ins_faults) / ins_refs
+        : 0.0;
+
+    double data_rate = data_refs
+        ? static_cast<double>(data_faults) / data_refs
+        : 0.0;
+
+
+    cout << "Dynamic L2 replacement statistics" << endl;
+    cout << "Instruction accesses in current epoch: " << ins_refs << endl;
+    cout << "Data accesses in current epoch: " << data_refs << endl;
+    cout << "Instruction misses in current epoch: " << ins_faults << endl;
+    cout << "Data misses in current epoch: " << data_faults << endl;
+    cout << "Instruction miss rate: " << ins_rate << endl;
+    cout << "Data miss rate: " << data_rate << endl;
+    cout << "Accesses in current epoch: " << seen << endl;
+    cout << "Misses in current epoch: " << misses << endl;
+    cout << "Policy changes: " << policy_changes << endl;
+    cout << "Final policy: "
+         << (prefer_ins ? "I-RRIP" : "RRIP") << endl;
+}
