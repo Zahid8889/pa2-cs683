@@ -2,6 +2,8 @@
 
 #define RRPV_MAX 3
 #define LEADER_COUNT 8
+#define DECISION_THRESHOLD 0.25
+#define SAMPLE_EPOCH_SIZE 4096
 
 uint32_t age_table[L2C_SET][L2C_WAY];
 
@@ -11,6 +13,10 @@ uint64_t ins_refs = 0;
 uint64_t data_refs = 0;
 uint64_t ins_faults = 0;
 uint64_t data_faults = 0;
+uint64_t all_ins_refs = 0;
+uint64_t all_data_refs = 0;
+uint64_t all_ins_faults = 0;
+uint64_t all_data_faults = 0;
 
 bool prefer_ins = false;
 
@@ -34,8 +40,13 @@ void CACHE::l2c_initialize_replacement()
     data_refs = 0;
     ins_faults = 0;
     data_faults = 0;
+    all_ins_refs = 0;
+    all_data_refs = 0;
+    all_ins_faults = 0;
+    all_data_faults = 0;
     prefer_ins = false;
 }
+
 
 uint32_t CACHE::l2c_find_victim(
     uint32_t cpu,
@@ -73,6 +84,8 @@ uint32_t CACHE::l2c_find_victim(
     return 0;
 }
 
+
+
 void CACHE::l2c_update_replacement_state(
     uint32_t cpu,
     uint32_t set,
@@ -90,30 +103,34 @@ void CACHE::l2c_update_replacement_state(
     if (sampled_set(set) && type != WRITEBACK) {
         if (isInstruction) {
             ins_refs++;
+            all_ins_refs++;
 
-            if (!hit)
+            if (!hit) {
                 ins_faults++;
+                all_ins_faults++;
+            }
         } else {
             data_refs++;
+            all_data_refs++;
 
-            if (!hit)
+            if (!hit) {
                 data_faults++;
+                all_data_faults++;
+            }
         }
 
         uint64_t seen = ins_refs + data_refs;
+        uint64_t misses = ins_faults + data_faults;
 
-        if (seen >= 4096) {
-            double ins_rate = ins_refs
-                ? static_cast<double>(ins_faults) / ins_refs
-                : 0.0;
+        if (seen >= SAMPLE_EPOCH_SIZE) {
+            double score = 0.0;
 
-            double data_rate = data_refs
-                ? static_cast<double>(data_faults) / data_refs
-                : 0.0;
+            if (seen + misses > 0) {
+                score = static_cast<double>(ins_refs + ins_faults)
+                      / static_cast<double>(seen + misses);
+            }
 
-
-            bool next_policy =
-                ins_rate > data_rate && ins_rate > 0.40;
+            bool next_policy = score > DECISION_THRESHOLD;
 
             if (next_policy != prefer_ins) {
                 prefer_ins = next_policy;
@@ -140,18 +157,19 @@ void CACHE::l2c_update_replacement_state(
     }
 }
 
+
 void CACHE::l2c_replacement_final_stats()
 {
-    uint64_t seen = ins_refs + data_refs;
-    uint64_t misses = ins_faults + data_faults;
+    uint64_t seen = all_ins_refs + all_data_refs;
+    uint64_t misses = all_ins_faults + all_data_faults;
 
-    double ins_rate = ins_refs
-        ? static_cast<double>(ins_faults) / ins_refs
-        : 0.0;
+    double ins_rate = all_ins_refs
+            ? static_cast<double>(all_ins_faults) / all_ins_refs
+            : 0.0;
 
-    double data_rate = data_refs
-        ? static_cast<double>(data_faults) / data_refs
-        : 0.0;
+    double data_rate = all_data_refs
+            ? static_cast<double>(all_data_faults) / all_data_refs
+            : 0.0;
 
 
     cout << "Dynamic L2 replacement statistics" << endl;
